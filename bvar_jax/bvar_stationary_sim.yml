@@ -1,0 +1,74 @@
+# --- bvar_stationary_sim.yml ---
+# Simple YAML configuration for simulation example
+
+model_info:
+  name: "BVAR Stationary Simulation Example"
+  description: "Simplified model for simulation/testing"
+
+variables:
+  observable:
+    - name: "gdp"
+      description: "Simulated GDP"
+    - name: "inf"
+      description: "Simulated Inflation"
+  trends:
+    - name: "trend_gdp"
+      description: "Simulated GDP Trend"
+    - name: "trend_inf"
+      description: "Simulated Inflation Trend"
+  stationary:
+    - name: "cycle_gdp"
+      description: "Simulated GDP Cycle"
+    - name: "cycle_inf"
+      description: "Simulated Inflation Cycle"
+
+var_order: 1
+prior_type: "stationary" # Must be stationary for the JAX implementation
+
+stationary_prior:
+  hyperparameters:
+    es: [0.5, 0.1]  # Prior means for A diag, A off-diag (used in model, but not directly for simulation true params)
+    fs: [0.5, 0.5]  # Prior stds for A diag, A off-diag
+    gs: [3.0, 3.0]  # Gamma alpha for A precision
+    hs: [1.0, 1.0]  # Gamma beta for A precision
+  covariance_prior:
+    eta: 1.1       # LKJ shape parameter for stationary correlations
+  stationary_shocks:
+    cycle_gdp:
+        distribution: "inverse_gamma"
+        parameters:
+          alpha: 2.3
+          beta:  0.3
+    cycle_inf:
+        distribution: "inverse_gamma"
+        parameters:
+          alpha: 2.3
+          beta: 0.06
+
+trend_shocks:
+  # eta: 2.0  # LKJ eta for trends - seems unused in PyMC stationary code, but keep for structure
+  trend_shocks: # Specific trend shock variances (diagonal Sigma_trends)
+    trend_gdp:
+      distribution: "inverse_gamma"
+      parameters:
+        alpha: 2.3
+        beta: 0.1
+    trend_inf:
+      distribution: "inverse_gamma"
+      parameters:
+        alpha: 2.3
+        beta: 0.2
+
+model_equations:
+  - gdp: "trend_gdp + cycle_gdp"
+  - inf: "trend_inf + cycle_inf"
+
+# extra_reporting_equations: # Not needed for basic simulation example
+
+initial_conditions:
+  states: # Fixed initial means and variances for the state vector
+    trend_gdp: {mean: 2.0, var: 1.0} # Corresponds to trends[0, 0] initial state mean/variance
+    trend_inf: {mean: 2.5, var: 1.0} # Corresponds to trends[0, 1] initial state mean/variance
+    cycle_gdp: {mean: 0.0, var: 0.5} # Corresponds to stationary[0, 0] initial state mean/variance
+    cycle_inf: {mean: 0.0, var: 0.3} # Corresponds to stationary[0, 1] initial state mean/variance
+  # covariance_scaling: # Not used for diagonal P0 initialization based on PyMC code

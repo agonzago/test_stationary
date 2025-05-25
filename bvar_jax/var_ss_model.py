@@ -1,372 +1,592 @@
+# --- var_ss_model.py (Final Corrected) ---
+# NumPyro model for the BVAR with stationary prior and trends.
+
 import jax
 import jax.numpy as jnp
+import jax.random as random
 import jax.scipy.linalg as jsl
 import numpyro
-import numpyro.distributions as dist
+from numpyro import distributions as dist
 from numpyro.distributions import constraints
-from numpyro.distributions.util import promote_to_dense, triangular_to_full
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Any, Sequence, Optional
 
-# Assuming utils directory is in the Python path
-from utils.stationary_prior_jax_simplified import make_stationary_var_transformation_jax, create_companion_matrix_jax, check_stationarity_jax
+# Assuming utils directory is in the Python path and contains the necessary files
+from utils.stationary_prior_jax_simplified import make_stationary_var_transformation_jax, create_companion_matrix_jax # Removed check_stationarity_jax
 from utils.Kalman_filter_jax import KalmanFilter # Use the standard KF for likelihood
 
 # Configure JAX for float64
 jax.config.update("jax_enable_x64", True)
 _DEFAULT_DTYPE = jnp.float64
 
-# Add a small jitter for numerical stability, especially in Lyapunov solver
+# Add a small jitter for numerical stability
 _MODEL_JITTER = 1e-8
 
-def numpyro_var_ss_model(y: jax.Array, m: int, p: int):
+
+# Helper function to get static off-diagonal indices (Moved here)
+def _get_off_diagonal_indices(n: int) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
-    NumPyro model for a stationary VAR(p) process in state-space form.
+    Generates row and column indices for off-diagonal elements of an n x n matrix.
+    These indices are static once n is known.
+    """
+    if n <= 1: # No off-diagonal elements for 0x0 or 1x1 matrices
+        return jnp.empty((0,), dtype=jnp.int32), jnp.empty((0,), dtype=jnp.int32)
 
-    State space form:
-    x_t = T x_{t-1} + R epsilon_t, epsilon_t ~ N(0, I)
-    y_t = C x_t + eta_t, eta_t ~ N(0, H)
+    rows, cols = jnp.meshgrid(jnp.arange(n), jnp.arange(n))
+    mask = jnp.eye(n, dtype=bool)
+    off_diag_rows = rows[~mask]
+    off_diag_cols = cols[~mask]
+    return off_diag_rows, off_diag_cols
 
-    The state vector x_t is [y_t', y_{t-1}', ..., y_{t-p+1}']'.
-    T is the companion matrix derived from VAR coefficients Phi_1, ..., Phi_p.
-    R is related to the shock covariance Sigma of the VAR process y_t = Phi_1 y_{t-1} + ... + noise_t.
-    C selects the first m components of the state vector (y_t).
 
-    Priors are placed on unconstrained parameters (A matrices for VAR, Cholesky factors for Sigma and H).
-    Stationarity is ensured by transforming A matrices to Phi matrices.
-    The initial state distribution is the stationary distribution derived from T and R@R.T.
+# Helper function to parse model equations (JAX compatible version of _parse_equation)
+# This will be used internally during C matrix construction
+def _parse_equation_jax(
+    equation: str,
+    trend_names: List[str],
+    stationary_var_names: List[str],
+    measurement_param_names: List[str],
+    dtype=_DEFAULT_DTYPE
+) -> List[Tuple[Optional[str], str, float]]:
+    """
+    Parse a measurement equation string into components with signs.
+    Returns a list of tuples (param_name, state_name, sign).
+    param_name is None for direct state terms.
+    This function is executed *outside* the JAX graph (e.g., during model setup)
+    as it relies on string parsing. The result is used to build the C matrix inside the model.
+    """
+    # Pre-process the equation string
+    equation = equation.replace(' - ', ' + -')
+    if equation.startswith('-'):
+        equation = '-' + equation[1:].strip()
+
+    # Split terms by '+'
+    terms_str = [t.strip() for t in equation.split('+')]
+
+    parsed_terms = []
+    for term_str in terms_str:
+        sign = 1.0
+        if term_str.startswith('-'):
+            sign = -1.0
+            term_str = term_str[1:].strip()
+
+        if '*' in term_str:
+            parts = [p.strip() for p in term_str.split('*')]
+            if len(parts) != 2:
+                # In JAX model, we cannot raise Python exceptions easily within the traced code.
+                # We'll assume valid equations are passed based on config validation.
+                # If this was pure JAX, would need error handling via lax.cond or similar.
+                # For setup, we rely on config validation.
+                raise ValueError(f"Invalid term '{term_str}': Must have exactly one '*' operator")
+
+            param, state = None, None
+            if parts[0] in measurement_param_names:
+                param, state = parts[0], parts[1]
+            elif parts[1] in measurement_param_names:
+                param, state = parts[1], parts[0]
+            else:
+                 raise ValueError(
+                        f"Term '{term_str}' contains no valid parameter. "
+                        f"Valid parameters are: {measurement_param_names}"
+                    )
+
+            if (state not in trend_names and
+                state not in stationary_var_names):
+                 raise ValueError(
+                        f"Invalid state variable '{state}'. " # Simplified error message within JAX context
+                        # f"Invalid state variable '{state}' in term '{term_str}'. "
+                        # f"Valid states are: {trend_names + stationary_var_names}"
+                    )
+
+            parsed_terms.append((param, state, sign))
+        else:
+            if (term_str not in trend_names and
+                term_str not in stationary_var_names):
+                 raise ValueError(
+                        f"Invalid state variable '{term_str}'. " # Simplified error message within JAX context
+                        # f"Invalid state variable '{term_str}'. "
+                        # f"Valid states are: {trend_names + stationary_var_names}"
+                    )
+            parsed_terms.append((None, term_str, sign))
+
+    return parsed_terms
+
+
+# Main NumPyro Model
+def numpyro_bvar_stationary_model(
+    y: jax.Array, # shape (time_steps, k_endog)
+    config_data: Dict[str, Any], # Relevant parts of parsed YAML config including static indices
+    static_valid_obs_idx: jax.Array, # 1D array of indices in y that are observed
+    static_n_obs_actual: int, # Number of actually observed series
+    # Pass variable names and equations directly for easier access in model
+    trend_var_names: List[str],
+    stationary_var_names: List[str],
+    observable_names: List[str],
+    model_eqs: List[Tuple[str, str]], # Raw model equations list
+    initial_conds: Dict[str, Any], # Raw initial conditions dict
+    stationary_prior_config: Dict[str, Any],
+    trend_shocks_config: Dict[str, Any],
+    measurement_params_config: List[Dict[str, Any]] # List of dicts with name, prior, etc.
+):
+    """
+    NumPyro model for BVAR with trends using stationary prior.
+
+    State vector: [trend_vars', stationary_t', stationary_{t-1}', ...]'
+    For p=1: [trend_vars', stationary_t']'
 
     Args:
-        y: Observed data, shape (time_steps, full_obs_dim). Can contain NaNs.
-           Note: This model currently uses a Kalman filter implementation
-           that assumes a *constant* subset of observed series over time.
-           The 'full_obs_dim' is the total potential observation dimension.
-           Missing values (NaNs) are handled by identifying the subset of
-           series that are *always* observed and filtering only those.
-        m: Dimension of the VAR process (number of variables).
-        p: Order of the VAR process (number of lags).
+        y: Observed data, shape (time_steps, k_endog). Can contain NaNs.
+           The Kalman filter handles NaNs based on static_valid_obs_idx.
+        config_data: Dictionary containing the parsed YAML configuration,
+                     *including* 'static_off_diag_indices' and 'num_off_diag'.
+        static_valid_obs_idx: Indices of observed series (constant over time).
+        static_n_obs_actual: Number of actually observed series.
+        trend_var_names: List of names for trend state variables.
+        stationary_var_names: List of names for stationary state variables (cycles).
+        observable_names: List of names for observable variables.
+        model_eqs: List of tuples (observable_name, equation_string).
+        initial_conds: Dictionary from 'initial_conditions' in config.
+        stationary_prior_config: Dictionary from 'stationary_prior' in config.
+        trend_shocks_config: Dictionary from 'trend_shocks' in config.
+        measurement_params_config: List of dictionaries for measurement parameters.
     """
-    mp = m * p # Dimension of the state vector
+    # --- Dimensions ---
+    k_endog = len(observable_names)
+    k_trends = len(trend_var_names)
+    k_stationary = len(stationary_var_names)
+    p = config_data['var_order'] # VAR order
+    k_states = k_trends + k_stationary * p # Total state dimension
 
-    # --- Identify Observed Subset ---
-    # This logic assumes that some columns in `y` are *entirely* NaN (never observed)
-    # and some are *partially* or fully observed (at least one non-NaN value).
-    # The filter works on the subset of columns that are *always* potentially observed.
-    # Time-varying missing data (NaNs within an otherwise observed column) are handled
-    # by the filter's internal jnp.isfinite checks, but the structure of C and H
-    # is fixed based on the initial assessment here.
+    # Get pre-parsed structures from config_data
+    initial_conds_parsed = config_data['initial_conditions_parsed']
+    parsed_model_eqs_list = config_data['model_equations_parsed'] # Already pre-parsed list of (obs_idx, parsed_terms)
+    trend_names_with_shocks = config_data['trend_names_with_shocks']
+    n_trend_shocks = len(trend_names_with_shocks)
+    # Get static indices for off-diagonal elements of A from config_data
+    static_off_diag_rows, static_off_diag_cols = config_data['static_off_diag_indices']
+    num_off_diag = config_data['num_off_diag']
 
-    full_obs_dim = y.shape[-1] # Total number of potential observation series
-    T_steps = y.shape[0]
 
-    # Find columns with at least one non-NaN value
-    valid_obs_mask_cols = jnp.any(jnp.isfinite(y), axis=0)
-    static_valid_obs_idx = jnp.where(valid_obs_mask_cols)[0]
-    static_n_obs_actual = static_valid_obs_idx.shape[0]
+    n_shocks_state = n_trend_shocks + k_stationary # Shocks hitting state: trend shocks + current stationary shocks
 
-    # --- Sample Parameters ---
 
-    # 1. Unconstrained parameters for VAR coefficients (A matrices)
-    # Sample p matrices A_1, ..., A_p, each m x m.
-    # The transformation make_stationary_var_transformation_jax takes a list of m x m matrices.
-    # We sample a flattened array and reshape it.
-    a_flat = numpyro.sample("a_flat", dist.Normal(0., 1.).expand([p * m * m]))
-    A_list_unconstrained = [
-        jnp.reshape(a_flat[i * m * m : (i + 1) * m * m], (m, m))
-        for i in range(p)
-    ]
+    # --- Parameter Sampling ---
 
-    # 2. Shock Covariance Matrix (Sigma) for the VAR noise term
-    # Sample the Cholesky decomposition L_sigma where Sigma = L_sigma @ L_sigma.T
-    # L_sigma is lower triangular m x m. It has m*(m+1)/2 non-zero elements.
-    sigma_chol_packed = numpyro.sample(
-        "sigma_chol_packed",
-        dist.Normal(0., 1.).expand([m * (m + 1) // 2]) # Prior on unconstrained elements
+    # 1. Stationary VAR Coefficients (Phi_list)
+    # Sample unconstrained A matrix (p x k_stationary x k_stationary)
+    # Priors from stationary_prior_config: hyperparameters: es, fs
+    hyperparams = stationary_prior_config['hyperparameters']
+    es = jnp.asarray(hyperparams['es'], dtype=_DEFAULT_DTYPE)
+    fs = jnp.asarray(hyperparams['fs'], dtype=_DEFAULT_DTYPE)
+
+    # Sample diagonal and off-diagonal elements of A separately
+    diag_A = numpyro.sample(
+        "A_diag",
+        dist.Normal(es[0], fs[0]).expand([p, k_stationary])
     )
-    L_sigma = triangular_to_full(sigma_chol_packed, m, m, False) # False for lower triangular
-    Sigma = L_sigma @ L_sigma.T # Ensure Sigma is symmetric PSD
+    # Sample off-diagonal elements. Size is num_off_diag (statically known)
+    if num_off_diag > 0:
+        offdiag_A_flat = numpyro.sample(
+            "A_offdiag",
+            dist.Normal(es[1], fs[1]).expand([p, num_off_diag]) # Use static size here
+        )
+    else:
+        offdiag_A_flat = jnp.empty((p, 0), dtype=_DEFAULT_DTYPE) # Empty if no off-diagonal
 
-    # 3. Observation Noise Covariance Matrix (H)
-    # The observation equation is y_t = C x_t + eta_t.
-    # In this VAR state-space form, C x_t just selects y_t, y_{t-1}, etc.
-    # If y_t = [actual data], then H represents measurement error.
-    # If the state is [y_t, ...], and observation is [y_t] with *no* extra noise, H should be zero.
-    # However, the provided KalmanFilter takes H as input, and bvar_with_trends often includes measurement error.
-    # Let's assume H is a parameter for measurement error on the *full* potential observation vector y.
-    # H will be full_obs_dim x full_obs_dim.
-    # Sample the Cholesky decomposition L_H where H = L_H @ L_H.T
-    # L_H is lower triangular full_obs_dim x full_obs_dim.
 
-    h_chol_packed = numpyro.sample(
-        "h_chol_packed",
-        # Use HalfNormal for scale elements (diagonal of Cholesky) to enforce positivity
-        # And Normal for off-diagonal elements. Pack them appropriately.
-        dist.HalfNormal(1.).expand([full_obs_dim * (full_obs_dim + 1) // 2])
-    )
-    L_H_full = triangular_to_full(h_chol_packed, full_obs_dim, full_obs_dim, False)
-    H_full = L_H_full @ L_H_full.T # Ensure H_full is symmetric PSD
+    # Reconstruct A matrix (p x k_stationary x k_stationary) using static indices
+    A_unconstrained = jnp.zeros((p, k_stationary, k_stationary), dtype=_DEFAULT_DTYPE)
+
+    # Set diagonal elements
+    if k_stationary > 0:
+        A_unconstrained = A_unconstrained.at[:, jnp.arange(k_stationary), jnp.arange(k_stationary)].set(diag_A)
+        # Set off-diagonal elements using pre-calculated static indices
+        if num_off_diag > 0:
+            # Map flattened samples to the off-diagonal positions using static indices
+            A_unconstrained = A_unconstrained.at[:, static_off_diag_rows, static_off_diag_cols].set(offdiag_A_flat)
+
+    # A_draws is the (p, k_stationary, k_stationary) array
+    A_draws = A_unconstrained
+
+    # 2. Stationary Cycle Shock Variances (Diagonal of Sigma_cycles)
+    # Sample variances individually with InverseGamma priors
+    stationary_variances_list = []
+    stationary_shocks_spec = stationary_prior_config.get('stationary_shocks', {})
+
+    # Need to iterate in the specific order of stationary_var_names
+    for stat_var_name in stationary_var_names:
+        if stat_var_name not in stationary_shocks_spec:
+             # This should be caught by config validation ideally
+             raise ValueError(f"Missing shock specification for stationary variable '{stat_var_name}' in config.")
+
+        shock_spec = stationary_shocks_spec[stat_var_name]
+        if shock_spec['distribution'].lower() == 'inverse_gamma':
+            params = shock_spec['parameters']
+            var = numpyro.sample(
+                f"stationary_var_{stat_var_name}",
+                dist.InverseGamma(params['alpha'], params['beta'])
+            )
+            stationary_variances_list.append(var)
+        else:
+             raise NotImplementedError(f"Prior distribution '{shock_spec['distribution']}' not supported for stationary shock {stat_var_name}")
+
+    # Stack sampled variances into a diagonal matrix of *standard deviations*
+    if k_stationary == 0:
+        stationary_D_sds = jnp.empty((0, 0), dtype=_DEFAULT_DTYPE)
+        stationary_variances = jnp.empty((0,), dtype=_DEFAULT_DTYPE)
+    else:
+        stationary_variances = jnp.stack(stationary_variances_list, axis=-1) # shape (k_stationary,)
+        stationary_D_sds = jnp.diag(jnp.sqrt(jnp.maximum(stationary_variances, 1e-12))) # Ensure non-negative variance before sqrt! (k_stationary, k_stationary)
+
+
+    # 3. Stationary Cycle Correlation Cholesky
+    # LKJCholesky prior on the correlation matrix
+    stationary_lkj_concentration = stationary_prior_config.get('covariance_prior', {}).get('eta', 1.0) # Default 1.0 if not specified
+    
+    # Only sample if k_stationary > 1 (correlation matrix is 1x1 for k_stationary=1)
+    # if k_stationary > 1:
+    #     stationary_chol = numpyro.sample(
+    #         "stationary_chol",
+    #         dist.LKJCholesky(k_stationary, concentration=stationary_lkj_concentration)
+    #     ) # Samples the Cholesky factor of a correlation matrix (L_corr)
+    # elif k_stationary == 1:
+    #     # For 1x1 matrix, Cholesky of correlation is just 1. No sampling needed.
+    #     stationary_chol = jnp.eye(1, dtype=_DEFAULT_DTYPE)
+    # else: # k_stationary == 0
+    #     stationary_chol = jnp.empty((0, 0), dtype=_DEFAULT_DTYPE) # Empty if k_stationary == 0
+
+
+    # # Construct Sigma_cycles using the specific PyMC formula: Sigma_cycles = L_corr @ D_sds @ L_corr.T
+    # if k_stationary > 0:
+    #      Sigma_cycles = stationary_chol @ stationary_D_sds @ stationary_chol.T
+    #      Sigma_cycles = jnp.where(jnp.all(jnp.isfinite(Sigma_cycles)), Sigma_cycles, jnp.eye(k_stationary, dtype=_DEFAULT_DTYPE)*1e6) # Handle potential NaN/Inf
+    #      Sigma_cycles = (Sigma_cycles + Sigma_cycles.T)/2.0 # Ensure symmetry
+    # else:
+    #      Sigma_cycles = jnp.empty((0, 0), dtype=_DEFAULT_DTYPE)
+
+    # This directly samples the Cholesky factor of the covariance matrix
+    # Your approach is correct - just clean it up slightly
+    if k_stationary > 1:
+        # Sample correlation Cholesky factor
+        stationary_chol = numpyro.sample(
+            "stationary_chol",
+            dist.LKJCholesky(k_stationary, concentration=stationary_lkj_concentration)
+        )
+        
+        # Construct covariance matrix
+        Sigma_cycles = stationary_chol @ stationary_D_sds @ stationary_chol.T
+        
+        # Your safety checks are good
+        Sigma_cycles = jnp.where(
+            jnp.all(jnp.isfinite(Sigma_cycles)), 
+            Sigma_cycles, 
+            jnp.eye(k_stationary, dtype=_DEFAULT_DTYPE) * 1e6
+        )
+        Sigma_cycles = (Sigma_cycles + Sigma_cycles.T) / 2.0  # Ensure symmetry
+        
+    # 4. Trend Shock Variances (Diagonal of Sigma_trends)
+    # Sample variances individually with InverseGamma priors for trends *with shocks defined*
+    trend_variances_list = []
+    trend_shocks_spec = trend_shocks_config.get('trend_shocks', {})
+
+    # Need to iterate in the specific order of trend_names_with_shocks (from config_data)
+    for trend_name in trend_names_with_shocks:
+        # We already filtered to ensure these names are in trend_shocks_spec and have distribution
+        shock_spec = trend_shocks_spec[trend_name]
+        # Distribution is guaranteed to be inverse_gamma based on filtering in load_config_and_parse
+        params = shock_spec['parameters']
+        var = numpyro.sample(
+            f"trend_var_{trend_name}",
+            dist.InverseGamma(params['alpha'], params['beta'])
+        )
+        trend_variances_list.append(var)
+
+    if n_trend_shocks == 0:
+         # If no trends have shocks defined, Sigma_trends is 0x0
+         Sigma_trends = jnp.empty((0, 0), dtype=_DEFAULT_DTYPE)
+    else:
+         # Stack sampled variances into a diagonal matrix
+         trend_variances = jnp.stack(trend_variances_list, axis=-1) # shape (n_trend_shocks,)
+         Sigma_trends = jnp.diag(jnp.maximum(trend_variances, 1e-12)) # Ensure non-negative variance! (n_trend_shocks, n_trend_shocks)
+         Sigma_trends = (Sigma_trends + Sigma_trends.T) / 2.0 # Ensure symmetry
+
+
+    # 5. Measurement Parameters
+    # Sample individual measurement parameters based on config
+    measurement_params_sampled = {}
+    measurement_param_names = [p['name'] for p in measurement_params_config]
+    for param_spec in measurement_params_config:
+        param_name = param_spec['name']
+        prior_spec = param_spec['prior']
+        if prior_spec['distribution'].lower() == 'normal':
+            params = prior_spec['parameters']
+            measurement_params_sampled[param_name] = numpyro.sample(
+                param_name,
+                dist.Normal(params['mu'], params['sigma'])
+            )
+        elif prior_spec['distribution'].lower() == 'half_normal':
+            params = prior_spec['parameters']
+            measurement_params_sampled[param_name] = numpyro.sample(
+                param_name,
+                dist.HalfNormal(params['sigma']) # Note: HalfNormal takes scale param, often sigma
+            )
+        else:
+             # This should be caught by config validation ideally
+             raise NotImplementedError(f"Prior distribution '{prior_spec['distribution']}' not supported for measurement parameter {param_name}")
+
 
     # --- Transformations to State-Space Matrices ---
 
-    # 1. Transform unconstrained A matrices to VAR coefficients (Phi) and Gamma
-    # make_stationary_var_transformation_jax requires Sigma to be m x m,
-    # and returns phi_list = [Phi_1, ..., Phi_p] (each m x m) and gamma_list.
-    # Gamma is not directly used in the standard state-space formulation likelihood,
-    # but might be related to the stationary covariance derivation or interpretation.
-    # We need Phi_list for the companion matrix T.
-    phi_list, _ = make_stationary_var_transformation_jax(Sigma, A_list_unconstrained, m, p)
+    # 1. Transform unconstrained A to Phi_list
+    # Requires Sigma_cycles (VAR shock covariance) and A_draws
+    # Only perform transform if k_stationary > 0
+    if k_stationary > 0:
+        phi_list, _ = make_stationary_var_transformation_jax(Sigma_cycles, [A_draws[i] for i in range(p)], k_stationary, p)
+        # Check stationarity is removed as per user instruction
+        # is_stationary = check_stationarity_jax(phi_list, k_stationary, p)
+    else:
+        # If no stationary variables, phi_list is empty
+        phi_list = []
+        # is_stationary = jnp.array(True, dtype=jnp.bool_) # Process is trivially stationary
 
-    # Ensure transformed coefficients are finite (check_stationarity includes NaN check)
-    # If transformation resulted in NaNs, the process is non-stationary or transformation failed.
-    # We can factor a -infinity log-likelihood in this case.
-    is_stationary = check_stationarity_jax(phi_list, m, p)
 
-    # If not stationary or transformation failed, return -infinity likelihood
-    # This guides the sampler away from non-stationary regions.
-    # We can use a dummy likelihood contribution of -large_value if not stationary.
-    # We need to compute the full likelihood first, and then scale it or add a penalty.
-    # Or, use a numpyro.factor that is conditionally -inf.
-    # Let's add a large penalty if not stationary *after* computing the KF likelihood.
+    # 2. State Transition Matrix (T)
+    # T = [ I_{k_trends}  0_{k_trends, k_stationary*p} ]
+    #     [ 0_{k_stationary*p, k_trends}  AR_comp ]
+    T_comp = jnp.zeros((k_states, k_states), dtype=_DEFAULT_DTYPE)
+    T_comp = T_comp.at[:k_trends, :k_trends].set(jnp.eye(k_trends, dtype=_DEFAULT_DTYPE)) # Trends block
+    if k_stationary > 0:
+        # AR Companion block using Phi_list
+        T_comp = T_comp.at[k_trends:k_states, k_trends:k_states].set(create_companion_matrix_jax(phi_list, p, k_stationary))
 
-    # 2. State Transition Matrix (T) - The Companion Matrix
-    # T maps x_{t-1} to E[x_t | x_{t-1}].
-    # x_t = [y_t', y_{t-1}', ..., y_{t-p+1}']'
-    # E[y_t | ...] = Phi_1 y_{t-1} + ... + Phi_p y_{t-p}
-    # E[y_{t-1} | ...] = y_{t-1}
-    # ...
-    # E[y_{t-p+1} | ...] = y_{t-p+1}
-    # T = [Phi_1 Phi_2 ... Phi_p ]
-    #     [I_m   0     ... 0     ]
-    #     [0     I_m   ... 0     ]
-    #     [...                   ]
-    #     [0     ... I_m   0     ]
-    T_comp = create_companion_matrix_jax(phi_list, p, m) # Shape (mp, mp)
 
     # 3. State Shock Impact Matrix (R)
-    # x_t = T x_{t-1} + R epsilon_t.
-    # The state shock comes from the VAR noise term in the first m equations (for y_t).
-    # y_t = Phi_1 y_{t-1} + ... + Phi_p y_{t-p} + noise_t
-    # noise_t = L_sigma @ epsilon_t_m (where epsilon_t_m is m x 1 standard normal)
-    # The state shock vector should map the standard normal shock epsilon_t_mp (mp x 1)
-    # to the state dynamics.
-    # The state equation is:
-    # y_t = Phi_1 y_{t-1} + ... + Phi_p y_{t-p} + L_sigma epsilon_t_m
-    # y_{t-1} = y_{t-1}
-    # ...
-    # y_{t-p+1} = y_{t-p+1}
-    # So, the state shock vector is [L_sigma epsilon_t_m', 0, ..., 0]', where the 0s are m-dimensional zero vectors.
-    # The standard normal shock vector for the state space is epsilon_t_mp, size mp.
-    # R should be (mp, n_shocks_state). The non-zero shocks only hit the first m state elements.
-    # If n_shocks_state == m, R should map epsilon_t_m to [L_sigma epsilon_t_m', 0, ..., 0]'.
-    # This implies R is [L_sigma; 0_{m*(p-1) x m}].
-    R_comp = jnp.vstack([L_sigma, jnp.zeros((m * (p - 1), m), dtype=_DEFAULT_DTYPE)]) # Shape (mp, m)
-    # The covariance of R epsilon_t is R @ R.T = [L_sigma @ L_sigma.T, 0; 0, 0] = [Sigma, 0; 0, 0].
-    # This matches the structure: Q_comp = [Sigma, 0; 0, 0], shape (mp, mp).
+    # R has shape (k_states, n_trend_shocks + k_stationary).
+    # R maps [trend_shocks_std_normal', stationary_shocks_std_normal']' to state dynamics.
+    R_comp = jnp.zeros((k_states, n_shocks_state), dtype=_DEFAULT_DTYPE)
+
+    # Trends with shocks: I_{n_trend_shocks} in top-left block, mapping to trend state indices with shocks
+    # R[trend_state_idx, shock_idx] = 1.0
+    trend_state_indices = {name: i for i, name in enumerate(trend_var_names)} # Need this map again
+    trend_shock_mapping_indices = {name: i for i, name in enumerate(trend_names_with_shocks)}
+    for trend_name_with_shock in trend_names_with_shocks:
+        trend_state_idx = trend_state_indices[trend_name_with_shock]
+        shock_idx = trend_shock_mapping_indices[trend_name_with_shock]
+        R_comp = R_comp.at[trend_state_idx, shock_idx].set(1.0)
+
+    # Stationary shocks: I_{k_stationary} mapping to the *current* stationary state block (indices k_trends to k_trends+k_stationary-1)
+    if k_stationary > 0:
+        R_comp = R_comp.at[k_trends:k_trends+k_stationary, n_trend_shocks:].set(jnp.eye(k_stationary, dtype=_DEFAULT_DTYPE))
 
     # 4. Observation Matrix (C)
-    # y_t = C x_t + eta_t
-    # x_t = [y_t', y_{t-1}', ..., y_{t-p+1}']'
-    # The observation is just y_t (the first m elements of the state).
-    # C selects these: C = [I_m, 0, ..., 0], shape (m, mp).
-    C_comp_full_obs_dim = jnp.hstack([jnp.eye(m, dtype=_DEFAULT_DTYPE), jnp.zeros((m, m * (p - 1)), dtype=_DEFAULT_DTYPE)]) # Shape (m, mp)
+    # C has shape (k_endog, k_states). Based on parsed equations and sampled measurement params.
+    C_comp = jnp.zeros((k_endog, k_states), dtype=_DEFAULT_DTYPE)
+    # State indices for C matrix (Trends + Current Stationary)
+    state_indices_for_C = {name: i for i, name in enumerate(trend_var_names)} # Trends
+    state_indices_for_C.update({name: k_trends + i for i, name in enumerate(stationary_var_names)}) # Current Stationary
 
-    # The observation matrix C in the Kalman filter takes state to the *full* observation space.
-    # If full_obs_dim > m, the observation equation implies we observe more than just y_t.
-    # However, the VAR state definition [y_t, y_{t-1}, ...] only naturally produces y_t.
-    # The C matrix should map state to the *full* observed space, using the static_valid_obs_idx logic.
-    # The standard VAR setup often implies observing only y_t variables. If full_obs_dim > m,
-    # it suggests either some observed series are *not* in the state vector (unlikely in standard form)
-    # or the observation model is different. Let's assume the standard VAR state-space where we
-    # potentially observe the first m components of the state, possibly with measurement error.
-    # The C matrix passed to the KF should map (mp,) state to (full_obs_dim,) observation space.
-    # It should be an (full_obs_dim, mp) matrix.
-    # It selects the first m state variables (y_t) for the relevant observation series.
-    # If the first m series of `y` correspond to y_t, and other series are also observed... this state space
-    # model doesn't explain them.
-    # Revisit bvar_with_trends structure: It uses a state vector of size (mp + n_deterministic),
-    # where the first mp are VAR states, and the rest are deterministic. The observation matrix
-    # maps this extended state to the observed series. The first m rows of the observation matrix
-    # map to the VAR variables. The state vector IS [y_t, y_{t-1}, ...]. So C should map state to
-    # observations.
-    # Let's assume the full observation space (full_obs_dim) includes *at least* the m VAR variables.
-    # C_full_obs_dim should be (full_obs_dim, mp). It should select the first m state elements
-    # for the first m observation dimensions, and handle other observation dimensions if needed.
-    # For a standard VAR(p) state space, C maps [y_t', ...] to y_t'. So C is [I_m | 0].
-    # If we observe more than m series, the state space model needs to be extended or H needs to cover cross-covariances.
-    # Let's assume the model observes the first m state variables (y_t) and the rest are measurement error or zero.
-    # A simple approach: C maps state to first m obs dims. Other obs dims have zero mapping from state.
-    # C_full_obs_dim = [ [I_m, 0_{m, m*(p-1)}], [0_{full_obs_dim-m, m*p}] ]
-    # This seems wrong. The state vector is defined based on the m variables. The observation model
-    # connects this state to the *actual* observed series.
-    # The C matrix should have shape (full_obs_dim, mp).
-    # It should pick out the relevant state elements for each observation series.
-    # For the first m series (y_t), it picks the first m state elements.
-    # C_full_obs_dim = [I_m | 0] for the first m rows.
-    # How the other full_obs_dim - m rows look depends on what those series observe.
-    # If we are only modeling the m VAR series, but observe more, the model is misspecified or needs extension.
-    # Let's assume the model only explains the first `m` observed series. The filter can still run
-    # with `full_obs_dim`, but the structure of C and H needs careful thought.
-    # Standard VAR state-space: observation is the first m state variables. C = [I_m, 0].
-    # The Kalman Filter in utils/Kalman_filter_jax.py takes C shape (n_obs_full, n_state).
-    # This means C_comp needs shape (full_obs_dim, mp).
-    # The simplest interpretation consistent with a VAR state vector is that C maps the state
-    # to a *potential* observation vector of size full_obs_dim, where the first m elements are y_t,
-    # and the rest are 0 or pick other state variables if the state vector was expanded (e.g. trends).
-    # Given the prompt is about a standard stationary VAR, let's assume C maps state to *only* the m VAR variables.
-    # Then n_obs_full = m. If y has more columns, they must be handled differently or ignored.
-    # Let's stick to the standard VAR state space definition.
-    # State: x_t = [y_t', ..., y_{t-p+1}']' (mp x 1)
-    # Observation: y_t_obs = C x_t + eta_t. If y_t_obs is the m x 1 vector y_t, then C = [I_m, 0].
-    # The provided KalmanFilter takes `C` as `n_obs_full x n_state`. This suggests n_obs_full is the full dim.
-    # Let's assume `y` contains the `m` VAR variables *first*, possibly followed by other series.
-    # The Kalman filter needs `C` (full_obs_dim, mp).
-    # For the first `m` rows of C, it's `[I_m | 0]`. For the remaining `full_obs_dim - m` rows, it's `[0 | 0]`
-    # assuming those other series are not explained by the VAR state.
-    C_for_kf = jnp.vstack([
-        jnp.hstack([jnp.eye(m, dtype=_DEFAULT_DTYPE), jnp.zeros((m, m * (p - 1)), dtype=_DEFAULT_DTYPE)]),
-        jnp.zeros((full_obs_dim - m, mp), dtype=_DEFAULT_DTYPE)
-    ]) # Shape (full_obs_dim, mp)
+    # Populate C matrix using the parsed structure and sampled measurement parameters
+    # parsed_model_eqs_list is list of (obs_idx, parsed_terms)
+    for obs_idx, parsed_terms in parsed_model_eqs_list:
+        for param_name, state_name_in_eq, sign in parsed_terms:
+            # State name in equation must map to index in state_indices_for_C
+            state_idx = state_indices_for_C[state_name_in_eq] # Map the name in the equation to its index
+            if param_name is None:
+                # Direct state term
+                C_comp = C_comp.at[obs_idx, state_idx].set(sign * 1.0)
+            else:
+                # Parameter * State term
+                param_value = measurement_params_sampled[param_name]
+                C_comp = C_comp.at[obs_idx, state_idx].set(sign * param_value)
 
     # 5. Observation Noise Covariance (H)
-    # This was sampled as H_full (full_obs_dim, full_obs_dim). This seems consistent
-    # with the Kalman filter taking H of shape (n_obs_full, n_obs_full).
+    # H is a zero matrix (k_endog, k_endog) based on PyMC code
+    H_comp = jnp.zeros((k_endog, k_endog), dtype=_DEFAULT_DTYPE)
+
 
     # --- Initial State Distribution ---
-    # Use the stationary distribution: x_0 ~ N(init_x, init_P)
-    # init_x = 0 for a zero-mean VAR (no constant term in the state equation)
-    # init_P satisfies the discrete-time Lyapunov equation: P = T @ P @ T.T + Q
-    # where Q = R @ R.T is the state shock covariance [Sigma, 0; 0, 0].
-    # We need to solve P - T @ P @ T.T = Q for P.
-    # jax.scipy.linalg.solve_discrete_lyapunov(A.T, Q) solves X = A @ X @ A.T + Q for X.
-    # So we need solve_discrete_lyapunov(T_comp.T, Q_comp).
-    init_x_comp = jnp.zeros(mp, dtype=_DEFAULT_DTYPE)
+    # Mean (init_x): Fixed values from parsed initial_conditions (means)
+    init_x_comp = jnp.zeros(k_states, dtype=_DEFAULT_DTYPE)
+    initial_state_parsed = initial_conds_parsed # Use the pre-parsed dict
+    # Full state indices including lags for p > 1 (same as state_indices_full)
+    state_indices_full = {name: i for i, name in enumerate(trend_var_names)} # Trends 0 to k_trends-1
+    for lag in range(p):
+         for i, name in enumerate(stationary_var_names):
+              if lag == 0: # Current cycle
+                   state_indices_full[name] = k_trends + i
+              else: # Lagged cycles
+                   lagged_state_name = f"{name}_t_minus_{lag}"
+                   lagged_state_idx = k_trends + lag * k_stationary + i
+                   state_indices_full[lagged_state_name] = lagged_state_idx
 
-    # Construct Q_comp = R_comp @ R_comp.T = [Sigma, 0; 0, 0]
-    Q_comp = R_comp @ R_comp.T # Shape (mp, mp)
-    # Ensure Q_comp is symmetric and regularized before solving Lyapunov
-    Q_comp = (Q_comp + Q_comp.T) / 2.0
-    Q_comp_reg = Q_comp + _MODEL_JITTER * jnp.eye(mp, dtype=_DEFAULT_DTYPE)
+    for state_name_parsed, parsed_config in initial_state_parsed.items():
+         if state_name_parsed in state_indices_full:
+             init_x_comp = init_x_comp.at[state_indices_full[state_name_parsed]].set(parsed_config['mean'])
+         # Note: Initial means for lagged stationary states are implicitly 0 if not listed in initial_conditions.
 
-    # Check if T_comp is stable (eigenvalues inside unit circle) BEFORE solving Lyapunov.
-    # The stationary prior transformation is supposed to ensure this for the Phi coefficients,
-    # but numerical precision or issues in transformation could lead to T_comp being unstable.
-    # solve_discrete_lyapunov requires A (here T_comp.T) to be stable.
-    # If not stable, the stationary covariance doesn't exist, or is infinite.
-    # In the non-stationary case, the filter likelihood is mathematically zero (log-likelihood is -inf).
-    # We should catch this and return -inf likelihood.
-    T_comp_stable = True
-    if not is_stationary: # check_stationarity_jax already checks eigenvalues < 1
-         T_comp_stable = False # Flag T_comp as unstable if Phi were non-stationary/NaN
 
-    init_P_comp = jnp.eye(mp, dtype=_DEFAULT_DTYPE) * 1e6 # Default to large covariance if solve fails
+    # Covariance (init_P): Diagonal matrix from parsed initial_conditions variances, repeated for lags
+    init_P_comp_diag_values = jnp.zeros(k_states, dtype=_DEFAULT_DTYPE)
+    # Populate diagonal P0 based on variances from parsed initial_conditions: states
+    for state_name_parsed, parsed_config in initial_state_parsed.items():
+         if state_name_parsed in state_indices_full:
+             state_idx = state_indices_full[state_name_parsed]
+             init_P_comp_diag_values = init_P_comp_diag_values.at[state_idx].set(parsed_config['var'])
 
-    # Solve Lyapunov equation only if T_comp is stable
-    def solve_lyapunov(T_comp_stable_arg, Q_comp_reg_arg):
-         try:
-              # T_comp_stable_arg is T_comp.T
-              P_sol = jsl.solve_discrete_lyapunov(T_comp_stable_arg, Q_comp_reg_arg)
-              # Check for NaNs/Infs in the solution
-              solution_valid = jnp.all(jnp.isfinite(P_sol))
-              # Check if the solution is positive semidefinite (or close) - solve_discrete_lyapunov should ensure this if T is stable
-              # evals = jnp.linalg.eigvalsh(P_sol) # eigvalsh for symmetric matrix
-              # is_psd = jnp.all(evals > -_MODEL_JITTER) # Check eigenvalues are non-negative
-              # return jnp.where(solution_valid & is_psd, P_sol, jnp.eye(mp)*1e6)
-              return jnp.where(solution_valid, P_sol, jnp.eye(mp, dtype=_DEFAULT_DTYPE)*1e6) # Just check for finite solution for now
-         except Exception:
-              # If solver raises an error (e.g., T is not stable), return default
-              return jnp.eye(mp, dtype=_DEFAULT_DTYPE)*1e6
+    # For lagged stationary states (p>1): PyMC sets variances to the same as current state variances.
+    if p > 1:
+         for lag in range(1, p):
+             for i, name in enumerate(stationary_var_names):
+                  current_state_name = name # Name in parsed initial conditions
+                  lagged_state_name = f"{name}_t_minus_{lag}" # Name in full state vector
+                  if current_state_name in initial_state_parsed and lagged_state_name in state_indices_full:
+                       current_var = initial_state_parsed[current_state_name]['var']
+                       lagged_idx = state_indices_full[lagged_state_name]
+                       init_P_comp_diag_values = init_P_comp_diag_values.at[lagged_idx].set(current_var)
 
-    init_P_comp_unreg = jax.lax.cond(
-         jnp.array(T_comp_stable), # Only try solving if the transform yielded a stationary T
-         lambda op: solve_lyapunov(op[0], op[1]),
-         lambda op: jnp.eye(mp, dtype=_DEFAULT_DTYPE)*1e6, # Return default if T is not stable
-         operand=(T_comp.T, Q_comp_reg)
-    )
+
+    init_P_comp = jnp.diag(init_P_comp_diag_values) # Shape (k_states, k_states)
 
     # Ensure init_P_comp is symmetric and regularized
-    init_P_comp = (init_P_comp_unreg + init_P_comp_unreg.T) / 2.0
-    init_P_comp = init_P_comp + _MODEL_JITTER * jnp.eye(mp, dtype=_DEFAULT_DTYPE)
+    init_P_comp = (init_P_comp + init_P_comp.T) / 2.0
+    init_P_comp = init_P_comp + _MODEL_JITTER * jnp.eye(k_states, dtype=_DEFAULT_DTYPE)
+
+    # Check if initial P is valid (not containing NaNs from parsing or negative vars)
+    is_init_P_valid_computed = jnp.all(jnp.isfinite(init_P_comp)) & jnp.all(jnp.diag(init_P_comp) >= 0)
 
 
     # --- Prepare Static Args for Kalman Filter ---
-    # The KalmanFilter expects static args derived from the observed subset.
-    # These must match the structure identified at the beginning.
-    # static_C_obs: C_for_kf restricted to rows corresponding to static_valid_obs_idx
-    static_C_obs = C_for_kf[static_valid_obs_idx, :] # Shape (n_obs_actual, mp)
+    # static_valid_obs_idx, static_n_obs_actual are passed directly
+    # static_C_obs: C_comp restricted to observed rows
+    static_C_obs = C_comp[static_valid_obs_idx, :] # Shape (n_obs_actual, k_states)
 
-    # static_H_obs: H_full restricted to rows/cols corresponding to static_valid_obs_idx
-    static_H_obs = H_full[static_valid_obs_idx[:, None], static_valid_obs_idx] # Shape (n_obs_actual, n_obs_actual)
+    # static_H_obs: H_comp restricted to observed rows/cols (will be zero matrix)
+    static_H_obs = H_comp[static_valid_obs_idx[:, None], static_valid_obs_idx] # Shape (n_obs_actual, n_obs_actual)
 
     # static_I_obs: Identity matrix of size n_obs_actual
     static_I_obs = jnp.eye(static_n_obs_actual, dtype=_DEFAULT_DTYPE)
 
 
     # --- Instantiate and Run Kalman Filter ---
-    # The filter takes T, R, C, H, init_x, init_P
-    # T = T_comp (mp, mp)
-    # R = R_comp (mp, m) - maps m standard normal shocks to state shocks
-    # C = C_for_kf (full_obs_dim, mp) - maps state to *full* observation space
-    # H = H_full (full_obs_dim, full_obs_dim) - covariance of *full* observation noise
-    # init_x = init_x_comp (mp,)
-    # init_P = init_P_comp (mp, mp)
-
     # Ensure all inputs to KF have the correct dtype
     T_comp = jnp.asarray(T_comp, dtype=_DEFAULT_DTYPE)
     R_comp = jnp.asarray(R_comp, dtype=_DEFAULT_DTYPE)
-    C_for_kf = jnp.asarray(C_for_kf, dtype=_DEFAULT_DTYPE)
-    H_full = jnp.asarray(H_full, dtype=_DEFAULT_DTYPE)
+    C_comp = jnp.asarray(C_comp, dtype=_DEFAULT_DTYPE) # Pass the full C matrix
+    H_comp = jnp.asarray(H_comp, dtype=_DEFAULT_DTYPE) # Pass the full H matrix
     init_x_comp = jnp.asarray(init_x_comp, dtype=_DEFAULT_DTYPE)
     init_P_comp = jnp.asarray(init_P_comp, dtype=_DEFAULT_DTYPE)
 
-
     # Instantiate KalmanFilter
-    kf = KalmanFilter(T_comp, R_comp, C_for_kf, H_full, init_x_comp, init_P_comp)
+    kf = KalmanFilter(T_comp, R_comp, C_comp, H_comp, init_x_comp, init_P_comp)
 
     # Run the filter. Need to pass the full `y` data matrix and the static args.
-    # Note: The filter expects `y` shape (T, n_obs_full).
     filter_results = kf.filter(
         y,
         static_valid_obs_idx,
         static_n_obs_actual,
-        static_C_obs,
-        static_H_obs,
-        static_I_obs
+        static_C_obs, # Use the sliced C
+        static_H_obs, # Use the sliced H (zero)
+        static_I_obs # Use the sliced I
     )
 
     # --- Compute Total Log-Likelihood ---
-    # The filter returns log-likelihood contributions for each time step where an update occurred.
-    # We sum these contributions.
     total_log_likelihood = jnp.sum(filter_results['log_likelihood_contributions'])
 
-    # --- Add Likelihood to Model ---
-    # numpyro.factor adds an arbitrary contribution to the log-probability.
-    # This is where the observed data likelihood is incorporated.
+    # --- Add Likelihood and Penalties ---
+    # Stationarity check and penalty removed as per user instruction.
 
-    # Add a penalty if the process is not stationary or Lyapunov failed significantly.
-    # The check_stationarity_jax function returning False or init_P_comp being large (~default)
-    # indicates non-stationarity or numerical issues.
-    # A large positive penalty subtracts from the log-likelihood.
-    penalty = jnp.where(is_stationary, 0.0, -1e10) # Apply a large penalty if not stationary
+    # Add penalty if the initial P matrix is invalid (unlikely with diagonal from config)
+    penalty_init_P = jnp.where(is_init_P_valid_computed, 0.0, -1e10)
 
-    # Check if init_P_comp is potentially invalid (e.g., default large value)
-    # This can happen if Lyapunov solve failed.
-    is_init_P_valid = jnp.all(jnp.isfinite(init_P_comp)) # Check for NaNs/Infs
-    is_init_P_large = jnp.max(jnp.abs(init_P_comp)) > 1e5 # Check if it's the default large value
+    # If any NaNs occurred *before* the Kalman filter (e.g., during matrix construction)
+    # This could happen if transformation or covariance construction failed numerically.
+    # Check some key matrices for NaNs as a final safeguard before likelihood.
+    # Add a penalty if T, R, C, H, init_x, or init_P contain NaNs
+    matrices_to_check = [T_comp, R_comp, C_comp, H_comp, init_x_comp[None, :], init_P_comp] # Add dummy time dim for x
+    any_matrix_nan = jnp.array(False)
+    for mat in matrices_to_check:
+        any_matrix_nan |= jnp.any(jnp.isnan(mat))
 
-    # Add another penalty if the stationary initial covariance could not be computed correctly
-    penalty += jnp.where(is_init_P_valid & (~is_init_P_large), 0.0, -1e10)
+    penalty_matrix_nan = jnp.where(any_matrix_nan, -1e10, 0.0)
 
 
-    # Add the log likelihood contribution
-    numpyro.factor("log_likelihood", total_log_likelihood + penalty)
+    numpyro.factor("log_likelihood", total_log_likelihood + penalty_init_P + penalty_matrix_nan) # Include penalty for invalid P and NaNs
 
-    # --- (Optional) Expose Transformed Parameters ---
-    # We can use numpyro.deterministic to save transformed parameters in the posterior.
-    numpyro.deterministic("phi_list", phi_list)
-    numpyro.deterministic("Sigma", Sigma)
-    numpyro.deterministic("H_full", H_full)
+
+    # --- Expose Transformed Parameters ---
+    numpyro.deterministic("Phi_list", phi_list) # Return phi_list (list of matrices) for p>1
+    numpyro.deterministic("Sigma_cycles", Sigma_cycles)
+    numpyro.deterministic("Sigma_trends", Sigma_trends) # Diagonal (n_trend_shocks, n_trend_shocks)
     numpyro.deterministic("T_comp", T_comp)
-    numpyro.deterministic("R_comp", R_comp)
-    numpyro.deterministic("C_for_kf", C_for_kf)
-    numpyro.deterministic("init_x_comp", init_x_comp)
-    numpyro.deterministic("init_P_comp", init_P_comp)
-    numpyro.deterministic("is_stationary", is_stationary)
+    numpyro.deterministic("R_comp", R_comp) # (k_states, n_trend_shocks + k_stationary)
+    numpyro.deterministic("C_comp", C_comp) # (k_endog, k_states)
+    numpyro.deterministic("H_comp", H_comp) # Zero matrix (k_endog, k_endog)
+    numpyro.deterministic("init_x_comp", init_x_comp) # (k_states,)
+    numpyro.deterministic("init_P_comp", init_P_comp) # (k_states, k_states)
+    # is_stationary removed as per user instruction
+    numpyro.deterministic("k_states", k_states) # Useful for downstream
+
+    # Expose sampled variances and correlation Cholesky for checking
+    # Stationary
+    if k_stationary > 0:
+         for i, name in enumerate(stationary_var_names):
+              # No need to check if sampled, just define the deterministic using the sampled variable
+              numpyro.deterministic(f"stationary_var_{name}_det", stationary_variances_list[i])
+         # Sampled stationary_chol only if k_stationary > 1, deterministic if k_stationary == 1
+         numpyro.deterministic("stationary_chol_det", stationary_chol)
+
+
+    # Trends
+    if n_trend_shocks > 0:
+        for i, name in enumerate(trend_names_with_shocks): # Only trends with shocks
+             # No need to check if sampled
+             numpyro.deterministic(f"trend_var_{name}_det", trend_variances_list[i])
+
+
+    # Measurement params
+    for param_name, param_value in measurement_params_sampled.items():
+         numpyro.deterministic(f"{param_name}_det", param_value)
+
+
+# Helper function to parse config initial states for NumPyro
+# Keep this function here or import it if it lives in config.py
+def parse_initial_state_config(initial_conditions_config: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+    """
+    Parse initial state configuration (means and variances) from config.yaml.
+    Replicates BVARConfig._parse_initial_state logic.
+    """
+    parsed_states = {}
+    raw_states_config = initial_conditions_config.get('states', {})
+
+    for state_name, state_config in raw_states_config.items():
+        parsed = {}
+        if isinstance(state_config, (int, float)):
+            parsed = {"mean": float(state_config), "var": 1.0}
+        elif isinstance(state_config, dict) and "mean" in state_config:
+            parsed = state_config
+        elif isinstance(state_config, str):
+            parts = state_config.split()
+            temp_result = {}
+            for i in range(0, len(parts), 2):
+                if i + 1 < len(parts):
+                    key = parts[i].strip().rstrip(':')
+                    value = float(parts[i + 1])
+                    temp_result[key] = value
+            if "mean" in temp_result:
+                if "var" not in temp_result:
+                    temp_result["var"] = 1.0
+                parsed = temp_result
+
+        if "mean" not in parsed:
+            # This case should ideally be caught by config validation
+            # In JAX, better to return NaN or large value if parsing fails unexpectedly
+            # For this helper used in setup, raising an error is acceptable.
+            raise ValueError(f"Could not parse mean for initial state '{state_name}'.")
+        if "var" not in parsed:
+             # This case should ideally be caught by config validation
+             raise ValueError(f"Could not parse variance for initial state '{state_name}'.")
+
+        # Ensure var is non-negative, clip at a small value
+        var_val = jnp.maximum(jnp.array(parsed["var"], dtype=_DEFAULT_DTYPE), 1e-12) # Ensure positive variance
+        parsed_states[state_name] = {"mean": jnp.array(parsed["mean"], dtype=_DEFAULT_DTYPE), "var": var_val}
+
+    return parsed_states
