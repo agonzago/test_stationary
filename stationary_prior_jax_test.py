@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np # For plotting
 
 # Import the JAX stationary prior functions (MAKE SURE THIS IS THE PYTHON LOOP VERSION)
-from stationary_prior_jax import (
+from stationary_prior_jax_simplified import (
     make_stationary_var_transformation_jax,
     check_stationarity_jax,
     create_companion_matrix_jax,
@@ -296,10 +296,15 @@ if __name__ == "__main__":
         transform_fail_ratio = res['transform_failed_count'] / res['n_samples'] if res['n_samples'] > 0 else 0.0
         check_fail_ratio_of_attempted = res['stationarity_check_failed_count'] / num_successful_transforms if num_successful_transforms > 0 else 0.0 # Ratio vs successful transforms, not attempted checks
 
-
-        # Corrected syntax: using double quotes for the outer f-string
+        # Pre-format strings to avoid complex nested f-strings in print
+        a_stat_ratio_str = f"{res['A_stationarity_ratio']:.1%}"
+        phi_ratio_str = f"{phi_ratio_successful_checked:.4f}" # Retained for consistency, was not the error source
+        transform_fail_str = f"{transform_fail_ratio:.1%}"
+        check_fail_str = f"{check_fail_ratio_of_attempted:.1%}"
+        
+        # Old commented line (for reference, will be removed by replace if it was part of search)
         #print(f"{f'Case {i+1}':<8} | {res['m']:<3} | {res['p']:<3} | {res['n_samples']:<7} | {f\"{res['A_stationarity_ratio']:.1%}\":<10} | {f'{phi_ratio_successful_checked:.4f}'<24} | {f'{transform_fail_ratio:.1%}'<18} | {f'{check_fail_ratio_of_attempted:.1%}'<28}")
-        print(f"{f'Case {i+1}':<8} | {res['m']:<3} | {res['p']:<3} | {res['n_samples']:<7} | {f'{res['A_stationarity_ratio']:.1%}\"':<10} | {f'{phi_ratio_successful_checked:.4f}'<24} | {f'{transform_fail_ratio:.1%}'<18} | {f'{check_fail_ratio_of_attempted:.1%}'<28}")
+        print(f"{f'Case {i+1}':<8} | {res['m']:<3} | {res['p']:<3} | {res['n_samples']:<7} | {a_stat_ratio_str:<10} | {phi_ratio_str:<24} | {transform_fail_str:<18} | {check_fail_str:<28}")
 
     # Plotting summary
     labels = [f"m={r['m']}, p={r['p']}" for r in all_results]
