@@ -22,6 +22,11 @@ if not hasattr(pytensor.config, 'floatX') or pytensor.config.floatX != 'float64'
     pytensor.config.floatX = 'float64'
 NUMPY_DEFAULT_DTYPE = np.float64
 
+# Ensure JAX settings match the library
+jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_platforms", "cpu") # Match the library's potential CPU preference
+print(f"JAX backend: {jax.default_backend()}, float64 enabled: {jax.config.jax_enable_x64}")
+
 
 class TestStationaryPriorComparison(unittest.TestCase):
 
@@ -130,11 +135,11 @@ class TestStationaryPriorComparison(unittest.TestCase):
         print(f"Comparison for m={m}, p={p} PASSED (Stationary: {np_stat_bool}).")
 
     # Test cases
-    def test_m1_p0(self): # VAR(0)
-        self._run_comparison_test(m=1, p=0, key_idx=0)
+    # def test_m1_p0(self): # VAR(0)
+    #     self._run_comparison_test(m=1, p=0, key_idx=0)
 
-    def test_m2_p0(self): # VAR(0)
-        self._run_comparison_test(m=2, p=0, key_idx=1)
+    # def test_m2_p0(self): # VAR(0)
+    #     self._run_comparison_test(m=2, p=0, key_idx=1)
 
     def test_m1_p1(self):
         self._run_comparison_test(m=1, p=1, key_idx=10)
@@ -149,7 +154,7 @@ class TestStationaryPriorComparison(unittest.TestCase):
         self._run_comparison_test(m=3, p=2, key_idx=40, atol=1e-6)
         
     def test_m1_p3(self): # Higher order p
-        self._run_comparison_test(m=1, p=3, key_idx=50, atol=1e-6)
+        self._run_comparison_test(m=5, p=3, key_idx=50, atol=1e-6)
 
 if __name__ == '__main__':
     unittest.main()

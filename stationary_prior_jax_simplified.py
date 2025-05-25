@@ -164,8 +164,8 @@ def rev_mapping_jax(P: List[jnp.ndarray], Sigma: jnp.ndarray, p: int, m: int) ->
                                                                                           # The loop is for k in 0..s-1.
                                                                                           # When k = 0, index is s. When k = s-1, index is 1.
 
-        if s < p - 1:
-            Sigma_rev[s + 1] = Sigma_rev[s] - quad_form_sym_jax(Sigma_for[s], phi_rev[s][s].T)
+        #if s < p - 1:
+        Sigma_rev[s + 1] = Sigma_rev[s] - quad_form_sym_jax(Sigma_for[s], phi_rev[s][s].T)
             
     phi_list_out = [phi_for[p - 1][i] for i in range(p)]
     gamma_list_out = [Gamma_trans[i+1] for i in range(p)] # Stan's Gamma is 1-indexed, so Gamma_trans[1]...Gamma_trans[p]

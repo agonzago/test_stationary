@@ -5,7 +5,7 @@ import pytensor
 import pytensor.tensor as pt
 from pytensor.tensor import nlinalg, slinalg
 from typing import List, Tuple
-
+import pymc as pm 
 # Ensure floatX is consistent
 if not hasattr(pytensor.config, 'floatX') or pytensor.config.floatX != 'float64':
     pytensor.config.floatX = 'float64'
@@ -211,25 +211,51 @@ def create_companion_matrix(Phi_list, p, m):
     return comp_matrix
 
 # Test function
+# def check_stationarity(phi_list, m, p):
+#     """
+#     Check if a VAR process is stationary based on its companion matrix.
+    
+#     Args:
+#         phi_list: List of p VAR coefficient matrices [phi_0, ..., phi_{p-1}]
+#         m: Dimension of the VAR
+#         p: Order of the VAR
+        
+#     Returns:
+#         True if the process is stationary, False otherwise
+#     """
+#     # Create companion matrix
+#     companion = create_companion_matrix(phi_list, p, m)
+    
+#     # Compute eigenvalues
+#     eigenvalues = pt.linalg.eigvals(companion)
+    
+#     # Check if all eigenvalues are inside the unit circle
+#     max_abs_eigenvalue = pt.max(pt.abs_(eigenvalues))
+    
+#     return max_abs_eigenvalue < 1.0
+
 def check_stationarity(phi_list, m, p):
     """
     Check if a VAR process is stationary based on its companion matrix.
-    
+
     Args:
         phi_list: List of p VAR coefficient matrices [phi_0, ..., phi_{p-1}]
         m: Dimension of the VAR
         p: Order of the VAR
-        
+
     Returns:
         True if the process is stationary, False otherwise
     """
     # Create companion matrix
     companion = create_companion_matrix(phi_list, p, m)
-    
-    # Compute eigenvalues
-    eigenvalues = nlinalg.eigvals(companion)
-    
+
+    # Compute eigenvalues using the correct path: pt.linalg.eigvals
+    eigenvalues = pt.linalg.eig(companion) # Corrected line
+
     # Check if all eigenvalues are inside the unit circle
-    max_abs_eigenvalue = pt.max(pt.abs_(eigenvalues))
+    max_abs_eigenvalue = pm.math.maximum(pm.math.abs(eigenvalues))
+
+    # Compile the PyTensor graph to get a numerical result
+    get_max_abs_eigenvalue = pytensor.function([], max_abs_eigenvalue)
     
-    return max_abs_eigenvalue < 1.0
+    return get_max_abs_eigenvalue() < 1.0
